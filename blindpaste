@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# blindpaste — 把剪贴板里的密文原地解码为明文，明文全程不经过屏幕。
+#
+# 明文只允许经由管道进 pbcopy，以及经由 shasum 变成 hash。
+# 它绝不出现在 stdout、argv、文件或任何命令行参数中。
+set -uo pipefail
+
+BP_KEY="${BLINDPASTE_KEY:-$HOME/.config/age/blindpaste.key}"
+BP_DEFAULT_TTL=90
+
+die() { printf 'blindpaste: %s\n' "$1" >&2; exit "${2:-1}"; }
+
+usage() {
+  cat <<'EOF'
+用法：
+  blindpaste [-t 秒]     读剪贴板里的密文，解码后写回剪贴板
+  blindpaste - [-t 秒]   密文从 stdin 读
+  blindpaste --sender    打印转发给对方的命令
+  blindpaste --init      生成 age keypair
+  -t 0                   不自动清空剪贴板（默认 90 秒后清空）
+EOF
+}
+
+# sniff <blob> -> age | b64 | none
+sniff() {
+  local blob=$1 compact
+  case $blob in
+    *'BEGIN AGE ENCRYPTED FILE'*) printf age; return 0 ;;
+  esac
+  compact=$(printf %s "$blob" | tr -d '[:space:]')
+  if [ -n "$compact" ] && printf %s "$compact" | grep -qE '^[A-Za-z0-9+/]+={0,2}$'; then
+    printf b64
+  else
+    printf none
+  fi
+}
+
+# hash_of <string> -> SHA-256 前 16 位
+hash_of() { printf %s "$1" | shasum -a 256 | cut -c1-16; }
+
+# describe <plain> -> "6 字符，全数字"。只描述形状，不含明文任何字节。
+describe() {
+  local p=$1 kind
+  case $p in
+    *[!A-Za-z0-9]*) kind='含符号' ;;
+    *[A-Za-z]*)     kind='含字母' ;;
+    *)              kind='全数字' ;;
+  esac
+  printf '%d 字符，%s' "${#p}" "$kind"
+}
+
+# decode <mode> <blob> -> 明文到 stdout。3 = 私钥不可读，4 = 未知模式
+decode() {
+  local mode=$1 blob=$2
+  case $mode in
+    b64) printf %s "$blob" | tr -d '[:space:]' | base64 -D 2>/dev/null ;;
+    age) [ -r "$BP_KEY" ] || return 3
+         printf %s "$blob" | age -d -i "$BP_KEY" 2>/dev/null ;;
+    *)   return 4 ;;
+  esac
+}
+
+# clear_if_unchanged <hash> <ttl>
+# ttl 秒后，仅当剪贴板仍是我们写入的那份内容时清空它。
+# 守卫的意义：避免把用户在这期间复制的其它东西删掉。
+clear_if_unchanged() {
+  local want=$1 ttl=$2
+  [ "$ttl" -gt 0 ] && sleep "$ttl"
+  if [ "$(hash_of "$(pbpaste)")" = "$want" ]; then
+    printf '' | pbcopy
+  fi
+  return 0
+}
+
+init_key() {
+  command -v age-keygen >/dev/null 2>&1 || die '未安装 age。先跑 brew install age' 3
+  [ -e "$BP_KEY" ] && die "密钥已存在：$BP_KEY（不覆盖）" 1
+  mkdir -p "$(dirname "$BP_KEY")" || die "无法创建 $(dirname "$BP_KEY")"
+  chmod 700 "$(dirname "$BP_KEY")"
+  ( umask 077; age-keygen -o "$BP_KEY" >/dev/null 2>&1 ) || die 'age-keygen 失败' 3
+  chmod 600 "$BP_KEY"
+  printf '密钥已生成：%s\n公钥（用 blindpaste --sender 拿给对方的完整命令）：\n' "$BP_KEY" >&2
+  grep -o 'age1[a-z0-9]*' "$BP_KEY" | head -1
+}
+
+# 始终打印 base64 版本，有密钥时追加 age 版本。
+# 我这边有没有密钥、和对方那边有没有装 age，是两件独立的事，脚本无法知道后者。
+sender_cmds() {
+  cat <<'EOF'
+# 转发给对方。两条都不会把明文写进对方的 shell history，也不依赖 pbcopy。
+
+# base64（对方无需装任何东西；只遮蔽，不加密）：
+printf 'secret: ' >&2; read -rs s; printf %s "$s" | base64 | tr -d '\n'; echo; unset s
+EOF
+  if [ -r "$BP_KEY" ]; then
+    local pub; pub=$(grep -o 'age1[a-z0-9]*' "$BP_KEY" | head -1)
+    printf '\n# age（对方需 brew install age；真加密，推荐）：\n'
+    printf "printf 'secret: ' >&2; read -rs s; printf %%s \"\$s\" | age -a -r %s; unset s\n" "$pub"
+  else
+    printf '\n# age 版本不可用：还没生成密钥。先跑 blindpaste --init\n'
+  fi
+}
+
+main() {
+  local ttl=$BP_DEFAULT_TTL src=clipboard blob mode plain rc
+
+  case ${1:-} in
+    --init)    init_key; return $? ;;
+    --sender)  sender_cmds; return 0 ;;
+    -h|--help) usage; return 0 ;;
+    --__clear) [ $# -eq 3 ] || die '--__clear <hash> <ttl>'
+               clear_if_unchanged "$2" "$3"; return 0 ;;
+  esac
+
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -t) [ $# -ge 2 ] || die '-t 需要一个参数'
+          case $2 in ''|*[!0-9]*) die "-t 需要非负整数：$2" ;; esac
+          ttl=$2; shift 2 ;;
+      -)  src=stdin; shift ;;
+      *)  die "未知参数：$1" ;;
+    esac
+  done
+
+  if [ "$src" = stdin ]; then blob=$(cat); else blob=$(pbpaste); fi
+  [ -n "$blob" ] || die '输入为空' 5
+
+  mode=$(sniff "$blob")
+  [ "$mode" != none ] || die '无法识别格式：既不是 age armor 也不是 base64。剪贴板未改动' 2
+
+  if [ "$mode" = age ] && ! command -v age >/dev/null 2>&1; then
+    die '这是 age 密文，但未安装 age。先跑 brew install age' 3
+  fi
+
+  plain=$(decode "$mode" "$blob"); rc=$?
+  case $rc in
+    0) ;;
+    3) die "找不到可读的私钥：$BP_KEY。先跑 blindpaste --init" 3 ;;
+    *) die "解码失败（$mode）。剪贴板未改动" 4 ;;
+  esac
+  [ -n "$plain" ] || die '解码结果为空。剪贴板未改动' 4
+  # sniff 无法区分真密文和一串恰好是 4 倍数长度的纯数字，后者解码出垃圾字节。
+  # 这个检查把那种情况变成干净的退出码 4，而不是往剪贴板里塞垃圾。
+  # 必须查「非可打印 ASCII」而不是「控制字符」：垃圾解码结果通常是 0x80-0xFF
+  # 的高位字节，那些不是控制字符。LC_ALL=C 让 [[:print:]] 严格等于 0x20-0x7E，
+  # 不受 locale 影响。
+  if printf %s "$plain" | LC_ALL=C grep -qE '[^[:print:]]'; then
+    die '解码结果含非可打印字符，多半不是给我的密文。剪贴板未改动' 4
+  fi
+
+  printf %s "$plain" | pbcopy
+  printf '✓ %s  →  剪贴板已就绪（%s）\n' "$mode" "$(describe "$plain")" >&2
+
+  if [ "$ttl" -gt 0 ]; then
+    # nohup 是必需的：否则关终端时 SIGHUP 杀掉它，剪贴板会永远留着明文。
+    # 传出去的是 hash 不是明文，且 hash 是纯十六进制，无注入风险。
+    nohup "$0" --__clear "$(hash_of "$plain")" "$ttl" >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+    printf '  %d 秒后自动清空（仅在剪贴板未被改动时）\n' "$ttl" >&2
+  fi
+}
+
+if [ "${BLINDPASTE_LIB:-}" != 1 ]; then
+  main "$@"
+fi
