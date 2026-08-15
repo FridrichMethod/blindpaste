@@ -5,7 +5,10 @@
 # 它绝不出现在 stdout、argv、文件或任何命令行参数中。
 set -uo pipefail
 
-BP_KEY="${BLINDPASTE_KEY:-$HOME/.config/age/blindpaste.key}"
+# 自包含：密钥默认放在脚本自己所在的目录，不往 $HOME 或任何系统位置写东西。
+# 用 BASH_SOURCE 而非 $0，这样 BLINDPASTE_LIB=1 被 source 时也能算对目录。
+BP_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+BP_KEY="${BLINDPASTE_KEY:-$BP_DIR/.blindpaste.key}"
 BP_DEFAULT_TTL=90
 
 die() { printf 'blindpaste: %s\n' "$1" >&2; exit "${2:-1}"; }
@@ -75,8 +78,13 @@ clear_if_unchanged() {
 init_key() {
   command -v age-keygen >/dev/null 2>&1 || die '未安装 age。先跑 brew install age' 3
   [ -e "$BP_KEY" ] && die "密钥已存在：$BP_KEY（不覆盖）" 1
-  mkdir -p "$(dirname "$BP_KEY")" || die "无法创建 $(dirname "$BP_KEY")"
-  chmod 700 "$(dirname "$BP_KEY")"
+  # 只在目录不存在时创建并收紧权限。默认密钥就在 repo 根目录里，
+  # 对一个已存在的目录 chmod 700 会改掉仓库本身的权限。
+  local dir; dir=$(dirname "$BP_KEY")
+  if [ ! -d "$dir" ]; then
+    mkdir -p "$dir" || die "无法创建 $dir"
+    chmod 700 "$dir"
+  fi
   ( umask 077; age-keygen -o "$BP_KEY" >/dev/null 2>&1 ) || die 'age-keygen 失败' 3
   chmod 600 "$BP_KEY"
   printf '密钥已生成：%s\n公钥（用 blindpaste --sender 拿给对方的完整命令）：\n' "$BP_KEY" >&2

@@ -10,6 +10,14 @@
 
 Spec：`docs/superpowers/specs/2026-08-10-blindpaste-design.md`
 
+> **执行后记（2026-08-15）：本文件是执行前的意图记录，其中若干代码片段已被实现推翻。当前事实以 `blindpaste`、`README.md` 和 spec 为准。** 三处偏离：
+>
+> 1. **Task 2 的可打印性检查是错的。** 原写 `case $plain in *[[:cntrl:]]*)`，但把纯数字误判为 base64 后解码出的是 0x80–0xFF 高位字节，不是控制字符，会被放过并写进剪贴板。实现改为 `printf %s "$plain" | LC_ALL=C grep -qE '[^[:print:]]'`。
+> 2. **Task 1 的 `BP_KEY` 默认值改为仓库内。** 原为 `$HOME/.config/age/blindpaste.key`，现为 `$BP_DIR/.blindpaste.key`（`BP_DIR` 由 `BASH_SOURCE` 推导）。连带 `init_key` 必须只在目录不存在时 `chmod 700` —— 否则会改掉仓库根目录权限。
+> 3. **Task 6 的安装步骤已取消。** 不装到 `~/.local/bin`，直接从仓库跑 `./blindpaste`。新增四条自包含断言。
+>
+> 另：实际执行走了 4 个 commit 而非本文的 6 个，TDD 循环更粗（完整测试文件先跑成红 → 一次实现 → 绿），不是逐 task 红绿。
+
 ## Global Constraints
 
 - 明文 `$plain` 绝不出现在 stdout、argv、文件或任何命令行参数中。只允许经由管道进 `pbcopy`，以及经由 `shasum` 变成 hash。

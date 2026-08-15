@@ -41,7 +41,7 @@ base64 只是遮蔽而非加密，这一点必须写进 README：它满足「我
 | `blindpaste` | 主路径。读剪贴板 → 嗅探 → 解码 → 写回剪贴板 |
 | `blindpaste -` | 同上，但密文从 stdin 读 |
 | `blindpaste --sender` | 打印转发给对方的命令。**始终同时打印两条**：base64 版本，以及 age 版本（仅当已 `--init`）。我按对方是否装了 `age` 自行取用 |
-| `blindpaste --init` | 生成 age keypair 到 `~/.config/age/blindpaste.key`，`chmod 600`，打印公钥 |
+| `blindpaste --init` | 生成 age keypair 到脚本所在目录的 `.blindpaste.key`，`chmod 600`，打印公钥。可用 `BLINDPASTE_KEY` 覆盖路径 |
 | `-t <秒>` | 覆盖自动清空 TTL，默认 90，`-t 0` 关闭 |
 | `blindpaste --__clear <hash>` | 内部用，由后台进程调用。见「自动清空」节 |
 
@@ -137,7 +137,11 @@ tests/run.sh          # 自带测试，零安装
 README.md             # 用法 + 限制章节
 ```
 
-开发在 `~/Downloads/passwd/`，完成后建议安装到 `~/.local/bin/` —— `Downloads` 会被清理，不适合放长期工具。
+仓库自包含：不安装到 `~/.local/bin` 或任何系统位置，直接从仓库目录跑 `./blindpaste`。
+
+自包含的推论是密钥必须留在仓库内（`.blindpaste.key`），因此：`.gitignore` 必须显式列出它；密钥路径必须由 `BASH_SOURCE` 推导而非 `$0`（否则 `BLINDPASTE_LIB=1` 被 source 时算错目录）；`init_key` 只在目录不存在时才 `mkdir` + `chmod 700`，因为默认目录就是仓库根目录，对已存在的目录 `chmod 700` 会改掉仓库自身权限。测试必须断言这些属性，包括用 `git check-ignore` 验证密钥被忽略。
+
+代价是仓库里躺着一个私钥。这是用自包含换来的，README 必须明确警告推远端前先确认。
 
 ## 测试
 

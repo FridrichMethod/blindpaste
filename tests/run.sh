@@ -80,7 +80,11 @@ if command -v age >/dev/null 2>&1 && command -v age-keygen >/dev/null 2>&1; then
   BLINDPASTE_KEY="$K" "$BP" --init >/dev/null 2>&1
   check '--init 不覆盖已有密钥' "$?" 1
   check '--sender 含 age 公钥' "$(BLINDPASTE_KEY="$K" "$BP" --sender | grep -c "$PUB")" 1
-  rm -rf "$TD"
+  # 密钥默认就在 repo 根目录里，对一个已存在的目录 chmod 700 会改掉仓库权限
+  TD2=$(mktemp -d); chmod 755 "$TD2"
+  BLINDPASTE_KEY="$TD2/k.txt" "$BP" --init >/dev/null 2>&1
+  check '--init 不改已存在目录的权限' "$(stat -f '%Lp' "$TD2")" 755
+  rm -rf "$TD" "$TD2"
 else
   sk 'age 往返（age 未安装，跑 brew install age 后重测）'
   sk '--init（age 未安装）'
@@ -94,6 +98,18 @@ check 'age 密文但缺 age 时退出码' "$?" 3
 check '--sender 总含 base64 版本' "$("$BP" --sender | grep -c 'base64')" 2
 # 只看非注释行：注释里提到 pbcopy 是说明文字，命令本身才不能依赖它
 check '--sender 不依赖 pbcopy' "$("$BP" --sender | grep -v '^#' | grep -c 'pbcopy')" 0
+
+printf '\n-- 自包含 --\n'
+DEFKEY=$(BLINDPASTE_LIB=1 bash -c '. ./blindpaste; printf %s "$BP_KEY"')
+case $DEFKEY in
+  "$PWD"/*) ok '默认密钥路径在 repo 内' ;;
+  *)        no "默认密钥路径逃出了 repo — $DEFKEY" ;;
+esac
+if git check-ignore -q "$DEFKEY"; then ok '默认密钥被 gitignore 覆盖'; else no '默认密钥未被 gitignore 覆盖'; fi
+# 只看代码行：注释里提到 $HOME 是说明文字（「不往 $HOME 写东西」）
+NOCOMMENT=$(grep -v '^[[:space:]]*#' blindpaste)
+check '代码不引用 $HOME'      "$(printf %s "$NOCOMMENT" | grep -c 'HOME')" 0
+check '代码不引用 .local/bin' "$(printf %s "$NOCOMMENT" | grep -c '.local/bin')" 0
 
 printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skip"
 [ "$fail" -eq 0 ]

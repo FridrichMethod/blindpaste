@@ -5,7 +5,7 @@
 `blindpaste` 把剪贴板里的密文原地替换为明文。明文只经由管道进 `pbcopy`，屏幕上只显示长度和字符类别：
 
 ```
-$ blindpaste
+$ ./blindpaste
 ✓ b64  →  剪贴板已就绪（6 字符，全数字）
   90 秒后自动清空（仅在剪贴板未被改动时）
 ```
@@ -19,12 +19,12 @@ $ blindpaste
 所以用法的第一步是把命令发给对方：
 
 ```sh
-blindpaste --sender
+./blindpaste --sender
 ```
 
 它打印出对方该跑的命令。这些命令有两个性质：不把明文写进对方的 shell history（用 `read -rs`），也不依赖 `pbcopy`（对方可能在 Linux 或 WSL）。密文本身不是秘密 —— 对方本来就知道明文 —— 所以直接打在他终端里、由他复制转发就行。
 
-对方把输出的那串乱码发给我，我选中复制，跑 `blindpaste`，然后 `Cmd-V`。
+对方把输出的那串乱码发给我，我选中复制，跑 `./blindpaste`，然后 `Cmd-V`。
 
 ## 两种格式的安全性不同
 
@@ -41,8 +41,8 @@ blindpaste --sender
 
 ```sh
 brew install age
-blindpaste --init          # 生成密钥到 ~/.config/age/blindpaste.key，权限 600
-blindpaste --sender        # 现在会同时打印 age 版本的命令
+./blindpaste --init          # 生成密钥到仓库根目录的 .blindpaste.key，权限 600
+./blindpaste --sender        # 现在会同时打印 age 版本的命令
 ```
 
 `--sender` 始终打印 base64 版本、有密钥时追加 age 版本：我这边有没有密钥、和对方那边有没有装 `age`，是两件独立的事，脚本无法知道后者，所以由我在转发时决定发哪条。
@@ -50,11 +50,11 @@ blindpaste --sender        # 现在会同时打印 age 版本的命令
 ## 用法
 
 ```
-blindpaste [-t 秒]     读剪贴板里的密文，解码后写回剪贴板
-blindpaste - [-t 秒]   密文从 stdin 读
-blindpaste --sender    打印转发给对方的命令
-blindpaste --init      生成 age keypair
--t 0                   不自动清空剪贴板（默认 90 秒后清空）
+./blindpaste [-t 秒]     读剪贴板里的密文，解码后写回剪贴板
+./blindpaste - [-t 秒]   密文从 stdin 读
+./blindpaste --sender    打印转发给对方的命令
+./blindpaste --init      生成 age keypair
+-t 0                     不自动清空剪贴板（默认 90 秒后清空）
 ```
 
 退出码：`0` 成功、`1` 用法错误、`2` 嗅探失败、`3` 缺依赖、`4` 解码失败、`5` 输入为空。**所有失败路径都保持剪贴板原样**，且不打印解码结果的任何字节。
@@ -63,13 +63,23 @@ blindpaste --init      生成 age keypair
 
 默认 90 秒后清空剪贴板，但清空前会重新比对剪贴板内容的 hash：**如果我在这期间复制了别的东西，就什么都不做。** 否则这个功能会变成「90 秒后把你刚复制的东西删掉」的 bug。
 
-## 安装
+## 自包含
+
+不需要安装。从仓库目录直接跑 `./blindpaste` 就行。
+
+这个工具不往 `$HOME`、`/usr/local`、shell 配置或任何系统位置写任何东西。age 私钥也生成在仓库根目录（`.blindpaste.key`），不在 `~/.config`。`tests/run.sh` 有四条断言锁住这个属性：默认密钥路径必须在仓库内、必须被 gitignore 覆盖、代码里不许出现 `$HOME` 或 `.local/bin`。
+
+代价是**仓库里躺着一个私钥**。`.gitignore` 明确列了 `.blindpaste.key`，测试也会用 `git check-ignore` 验证，但如果你要把这个仓库推到任何远端，先自己确认一遍。想把密钥放到别处就用环境变量覆盖：
 
 ```sh
-mkdir -p ~/.local/bin && ln -sf "$PWD/blindpaste" ~/.local/bin/blindpaste
+BLINDPASTE_KEY=~/somewhere/else.key ./blindpaste
 ```
 
-用符号链接而非拷贝，仓库里的改动立即生效。
+如果嫌每次打 `./` 麻烦，可以自己加个 alias（我没替你改任何 shell 配置）：
+
+```sh
+alias blindpaste="$PWD/blindpaste"
+```
 
 ## 测试
 
