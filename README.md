@@ -73,7 +73,7 @@ Exit codes: `0` success, `1` usage error (including `--init` when a key already 
 
 By default the clipboard is cleared after 90 seconds, but right before clearing, the clipboard's hash is compared again: **if you copied something else in the meantime, nothing happens.** Otherwise this feature would turn into "deletes whatever you copied 90 seconds later".
 
-The clearer is a background subshell that ignores SIGHUP, so closing the terminal doesn't kill it. The hash it compares against lives only in that process's memory, never in its command line: `ps` shows every process's arguments to all local users, and endpoint/audit software often logs them, and for a 6-digit code a hash is as good as the plaintext (all 10^6 candidates take under a second).
+The clearer is a background subshell that ignores SIGHUP, so closing the terminal doesn't kill it. The hash it compares against lives only in that process's memory, never in its command line: `ps` shows every process's arguments to all local users, and endpoint/audit software often logs them, and for a 6-digit code a hash is as good as the plaintext (all 10^6 candidates take under a second). The guard fails closed: if the hash can't be computed (no `shasum`), auto-clear is disabled with a warning instead of risking clearing the wrong thing.
 
 ## Self-contained
 
@@ -125,7 +125,7 @@ Also:
 
 - Trailing whitespace in the plaintext is stripped (inherent to shell command substitution). That's the right behavior for numeric codes.
 - The plaintext must be a single line of printable ASCII (bytes 0x20–0x7E). Non-ASCII secrets (CJK characters, accented letters, emoji) and multi-line secrets are rejected with exit code 4. That's the safety net described in the last item.
-- Binary ciphertext containing NUL bytes isn't supported — shell variables can't hold NUL. This tool is for text passwords.
+- Binary secrets aren't supported — shell variables can't hold NUL bytes, so a decoded result containing NUL is rejected with exit code 4. This tool is for text passwords.
 - If the machine shuts down or the background process is killed before the TTL expires, the clipboard isn't cleared.
 - Format detection can't tell real base64 apart from a plain string of digits or letters whose length happens to be valid base64. The script's safety net is "the decoded result must be printable ASCII", which turns that case into exit code 4 instead of putting garbage bytes on the clipboard. The net isn't perfect: garbage that happens to be all printable ASCII slips through, but the character class in the metadata line then shows `has symbols`, which is enough to notice something is off.
 

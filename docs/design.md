@@ -97,7 +97,8 @@ The metadata contains only: the format, the length (`${#plain}`), and a characte
 `sniff` can't tell real base64 from, say, a string of digits whose length happens to be a multiple of 4; decoding the latter yields garbage. So after decoding, every byte of the plaintext must be printable ASCII (0x20–0x7E); otherwise the script exits with code 4 and leaves the clipboard alone.
 
 - The check is "not printable ASCII", not "control character": garbage from decoding is usually high bytes (0x80–0xFF), which are not control characters.
-- The check is byte-level (`LC_ALL=C tr -d '[:print:]' | wc -c`). A `grep`-based check is line-oriented and would let an embedded newline through; a bash pattern depends on the locale.
+- The check is byte-level (`LC_ALL=C tr -d '\040-\176' | wc -c`). A `grep`-based check is line-oriented and would let an embedded newline through; a bash pattern depends on the locale; an explicit octal range doesn't depend on how a tr defines `[:print:]`.
+- Command substitution silently drops NUL bytes, so `main` pipes the decoder's output through `tr '\000' '\001'` before capturing it. A NUL thus becomes a control character that this check rejects, instead of vanishing and leaving an altered secret that passes. `pipefail` keeps the decoder's exit status.
 - Consequence: non-ASCII and multi-line secrets are not supported. Rejecting newlines is also the safer behavior: a blind paste containing a newline into a terminal would submit early.
 
 ### Auto-clear, with a hash guard
@@ -111,12 +112,15 @@ disown
 
 `clear_if_unchanged` does `sleep $ttl`, recomputes the first 16 hex digits of the SHA-256 of the current clipboard, compares them with the hash it was given, and **does nothing if they differ**. That avoids the bug of "deletes whatever I copied 90 seconds later".
 
+The guard fails closed. `clear_if_unchanged` ignores an empty or non-hex hash, because if `shasum` failed, both sides would be empty and `"" = ""` would wipe whatever is on the clipboard. `main` also checks that the hash has 16 characters before scheduling; if it doesn't, auto-clear is disabled with a warning (the clipboard write itself already succeeded, so the exit code stays 0).
+
 Why this shape:
 
 - **Ignoring SIGHUP is required.** Without it, closing the terminal kills the background process and the plaintext stays on the clipboard forever. `trap '' HUP` is what `nohup` does, and an ignored signal stays ignored in child processes (`sleep`, `pbpaste`).
 - **A subshell, not a re-exec of `"$0"`.** An earlier version ran `nohup "$0" --__clear <hash> <ttl> &`. That had two problems:
   1. The hash was in argv. Any local user can read argv with `ps`, and endpoint/audit software often logs it. For a low-entropy secret, a hash is as good as the plaintext: all 10^6 six-digit codes can be tried in well under a second against a 64-bit, unsalted SHA-256 prefix. In a subshell the hash only lives in process memory.
   2. It depended on how the script was invoked. With `bash blindpaste`, `$0` is a bare name; `nohup` looks it up on PATH, doesn't find it, and the error disappears into `/dev/null`, so the clipboard is silently never cleared.
+- `main` unsets `$plain` and `$blob` before forking, so the process that lives for the whole TTL doesn't carry the secret even after you've copied something else. This is best effort: bash can't scrub freed memory.
 - The clear logic is a plain function, so the tests call it directly (via `BLINDPASTE_LIB=1`) with `ttl=0`.
 
 The two hashes must be computed the same way: when writing, from the shell variable `$plain`; when checking, from `$(pbpaste)`. Command substitution has stripped trailing newlines from both, so they match.
@@ -155,7 +159,7 @@ The price is that a private key sits inside the repo. That's the trade for being
 - **The `org.nspasteboard.ConcealedType` marker.** This is the community convention that makes clipboard managers skip an entry, but neither `pbcopy` nor AppleScript can set it; it needs Swift or pyobjc. The README states prominently that a clipboard manager defeats the tool.
 - **Universal Clipboard (Handoff).** The clipboard syncs to iPhone/iPad. Turning off Handoff is a System Settings change, not code's job. The README mentions it.
 - **`age -p` passphrase mode.** It needs a second channel for the passphrase, which is more hassle than a one-time public key exchange.
-- **Binary or NUL-containing ciphertext, non-ASCII or multi-line plaintext.** Shell variables can't hold NUL, and the printable-ASCII safety net rejects the rest. The tool targets text passwords.
+- **Binary, non-ASCII or multi-line plaintext.** Shell variables can't hold NUL, and the printable-ASCII safety net rejects all of these (NUL included, see above). The tool targets text passwords.
 
 ## Known limitations
 
@@ -187,9 +191,9 @@ Coverage:
 2. age round trip: same (skipped and reported as skip when `age` isn't installed, never a silent pass).
 3. Sniffing: age armor, valid base64, base64 with whitespace, garbage, empty.
 4. Garbage doesn't pollute the clipboard: preset known content → feed garbage → clipboard unchanged and exit code 2.
-5. The safety net: digits mis-sniffed as base64, non-ASCII plaintext and multi-line plaintext all exit 4 with the clipboard unchanged.
-6. The hash guard, in both directions: (a) clipboard changed → `clear_if_unchanged <old hash> 0` → the new content survives; (b) clipboard unchanged → `clear_if_unchanged <correct hash> 0` → the clipboard is cleared. Testing only (a) would let an implementation that never clears pass.
-7. Auto-clear end to end: the background clearer really fires, both for `./blindpaste` and for `bash blindpaste`, and the hash of the secret appears in no process's argv while it waits.
+5. The safety net: digits mis-sniffed as base64, non-ASCII plaintext, multi-line plaintext and plaintext containing NUL all exit 4 with the clipboard unchanged.
+6. The hash guard, in both directions: (a) clipboard changed → `clear_if_unchanged <old hash> 0` → the new content survives; (b) clipboard unchanged → `clear_if_unchanged <correct hash> 0` → the clipboard is cleared. Testing only (a) would let an implementation that never clears pass. Plus failing closed: with `shasum` stubbed to fail, the guard keeps the clipboard, and `main` warns that auto-clear is disabled.
+7. Auto-clear end to end: the background clearer really fires, for both `./blindpaste` and `bash blindpaste`; it survives SIGHUP; and while it waits, the hash of the secret appears in no process's argv (sampled with `ps -ww` a second after start, once any exec has happened). `-t 08` is reported as 08s, not read as octal.
 8. No plaintext leak: capture stdout and stderr and assert that the plaintext isn't in them.
 9. Missing dependencies: fake age ciphertext with `age` hidden from `PATH` → exit 3 with the age message; no `pbcopy`/`pbpaste` → exit 3 with the macOS message.
 10. Sender commands: always include base64, never use `pbcopy`, round-trip leading/trailing spaces and backslashes, end the prompt line, produce one line of base64; the age command round-trips too.

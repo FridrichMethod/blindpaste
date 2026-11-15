@@ -9,7 +9,8 @@ ROOT=$(pwd -P)
 BP=./blindpaste
 
 pass=0; fail=0; skip=0
-ORIG=$(pbpaste)
+# The trailing x keeps command substitution from eating trailing newlines.
+ORIG=$(pbpaste; printf x); ORIG=${ORIG%x}
 trap 'printf %s "$ORIG" | pbcopy' EXIT
 
 ok() { pass=$((pass+1)); printf '  ok   %s\n' "$1"; }
@@ -70,6 +71,13 @@ printf 'abc\ndef' | base64 | tr -d '\n' | pbcopy
 "$BP" -t 0 >/dev/null 2>&1
 check 'multi-line plaintext: exit code' "$?" 4
 
+# Command substitution drops NUL bytes; they must be rejected, not removed.
+CT=$(printf '12\00034' | base64 | tr -d '\n')
+printf %s "$CT" | pbcopy
+"$BP" -t 0 >/dev/null 2>&1
+check 'plaintext with NUL: exit code' "$?" 4
+check 'plaintext with NUL: clipboard unchanged' "$(pbpaste)" "$CT"
+
 "$BP" --bogus >/dev/null 2>&1
 check 'unknown flag: exit code' "$?" 1
 "$BP" -t abc >/dev/null 2>&1
@@ -91,13 +99,35 @@ printf %s 'target-content' | pbcopy
 LIB clear_if_unchanged "$H" 0
 check 'guard clears an unchanged clipboard' "$(pbpaste)" ''
 
+# Fail closed: if shasum fails, both hashes are empty and must not "match".
+printf %s 'keep-me' | pbcopy
+BLINDPASTE_LIB=1 bash -c '. ./blindpaste; shasum() { return 1; }; clear_if_unchanged "$(hash_of x)" 0'
+check 'guard with an empty hash keeps the clipboard' "$(pbpaste)" 'keep-me'
+
+printf %s "$SECRET" | base64 | tr -d '\n' | pbcopy
+out=$(BLINDPASTE_LIB=1 bash -c '. ./blindpaste; shasum() { return 1; }; main -t 1' 2>&1); rc=$?
+check 'no shasum: still exits 0' "$rc" 0
+check 'no shasum: warns that auto-clear is off' "$(printf %s "$out" | grep -c 'auto-clear disabled')" 1
+
+# A leading zero must not be read as octal in the message. Its own plaintext,
+# and its clearer is stopped right away, so it cannot fire into later tests.
+printf %s 'only-for-t08' | base64 | tr -d '\n' | pbcopy
+out=$("$BP" -t 08 2>&1)
+pkill -f 'blindpaste -t 08$' 2>/dev/null
+check '-t 08: message says 08s' "$(printf %s "$out" | grep -c 'auto-clear in 08s')" 1
+check '-t 08: no printf error' "$(printf %s "$out" | grep -c 'invalid')" 0
+
 # End to end: the background clearer must really fire, must not depend on how
 # the script was invoked, and must never put the hash in any process's argv
 # (a hash of a 6-digit code can be brute-forced in well under a second).
 HS=$(LIB hash_of "$SECRET")
 printf %s "$SECRET" | base64 | tr -d '\n' | pbcopy
-"$BP" -t 1 >/dev/null 2>&1
-PS=$(ps -A -o command= 2>/dev/null)
+"$BP" -t 2 >/dev/null 2>&1
+# Wait first: right after the fork, a child that is about to exec still shows
+# the parent's argv, which would hide a hash passed on the command line.
+# -ww: BSD ps truncates the command column to the terminal width otherwise.
+sleep 1
+PS=$(ps -A -ww -o command= 2>/dev/null)
 if [ -z "$PS" ]; then
   sk 'hash not in any argv (ps unavailable)'
 elif printf %s "$PS" | grep -q "$HS"; then
@@ -112,6 +142,17 @@ printf %s "$SECRET" | base64 | tr -d '\n' | pbcopy
 bash blindpaste -t 1 >/dev/null 2>&1
 sleep 3
 check 'auto-clear fires (bash blindpaste)' "$(pbpaste)" ''
+
+# Closing the terminal sends SIGHUP; the clearer must survive it. The
+# background subshell keeps the parent's argv, so it can be found by it.
+printf %s "$SECRET" | base64 | tr -d '\n' | pbcopy
+"$BP" -t 2 >/dev/null 2>&1
+if pkill -HUP -f 'blindpaste -t 2$'; then
+  sleep 4
+  check 'auto-clear survives SIGHUP' "$(pbpaste)" ''
+else
+  no 'auto-clear survives SIGHUP -- background clearer not found'
+fi
 
 printf '\n-- sender commands --\n'
 SND=$("$BP" --sender)
