@@ -1,6 +1,7 @@
 .DS_Store
 
-# age 私钥。默认就生成在 repo 根目录（.blindpaste.key），绝不能提交。
+# age private key. It is created in the repo root by default
+# (.blindpaste.key) and must never be committed.
 .blindpaste.key
 *.key
 *.age

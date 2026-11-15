@@ -1,26 +1,52 @@
 #!/usr/bin/env bash
-# blindpaste — 把剪贴板里的密文原地解码为明文，明文全程不经过屏幕。
+# blindpaste - decode the ciphertext on the clipboard into plaintext, in place,
+# without the plaintext ever being shown on screen.
 #
-# 明文只允许经由管道进 pbcopy，以及经由 shasum 变成 hash。
-# 它绝不出现在 stdout、argv、文件或任何命令行参数中。
+# The plaintext may only flow through pipes: into pbcopy, and into shasum to
+# become a hash. It never appears on stdout, in argv, in a file, or in any
+# command-line argument.
+#
+# SPDX-License-Identifier: MIT
 set -uo pipefail
-
-# 自包含：密钥默认放在脚本自己所在的目录，不往 $HOME 或任何系统位置写东西。
-# 用 BASH_SOURCE 而非 $0，这样 BLINDPASTE_LIB=1 被 source 时也能算对目录。
-BP_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-BP_KEY="${BLINDPASTE_KEY:-$BP_DIR/.blindpaste.key}"
-BP_DEFAULT_TTL=90
 
 die() { printf 'blindpaste: %s\n' "$1" >&2; exit "${2:-1}"; }
 
+# Self-contained: the key defaults to the directory this script really lives
+# in, never to $HOME or any system location. Symlinks are resolved, so a
+# symlink on PATH still points at the repo (and its .gitignore).
+# BASH_SOURCE rather than $0 so this is also right when sourced with
+# BLINDPASTE_LIB=1. Builtins only (readlink is needed only for a symlink), so
+# this works even with a bare PATH. CDPATH is cleared so `cd` cannot jump
+# elsewhere or print anything.
+# bp_parent <path> -> sets the caller's local $dir to the parent of <path>.
+bp_parent() { case $1 in */*) dir=${1%/*}; dir=${dir:-/} ;; *) dir=. ;; esac; }
+bp_resolve_dir() {
+  local src=${BASH_SOURCE[0]} dir
+  while [ -L "$src" ]; do
+    bp_parent "$src"
+    dir=$(CDPATH= cd -P -- "$dir" && pwd) || return 1
+    src=$(readlink "$src") || return 1
+    case $src in /*) ;; *) src=$dir/$src ;; esac
+  done
+  bp_parent "$src"
+  CDPATH= cd -P -- "$dir" && pwd
+}
+
+BP_DIR=$(bp_resolve_dir) || die 'cannot resolve the script directory'
+BP_KEY="${BLINDPASTE_KEY:-$BP_DIR/.blindpaste.key}"
+BP_DEFAULT_TTL=90
+
 usage() {
   cat <<'EOF'
-用法：
-  blindpaste [-t 秒]     读剪贴板里的密文，解码后写回剪贴板
-  blindpaste - [-t 秒]   密文从 stdin 读
-  blindpaste --sender    打印转发给对方的命令
-  blindpaste --init      生成 age keypair
-  -t 0                   不自动清空剪贴板（默认 90 秒后清空）
+Usage:
+  blindpaste [-t SECONDS]     decode the ciphertext on the clipboard, put the plaintext back
+  blindpaste - [-t SECONDS]   read the ciphertext from stdin instead
+  blindpaste --sender         print the commands to forward to the sender
+  blindpaste --init           generate an age keypair
+  -t 0                        do not auto-clear the clipboard (default: clear after 90s)
+
+Exit codes: 0 ok, 1 usage error, 2 unrecognized format, 3 missing dependency,
+            4 decode failed, 5 empty input
 EOF
 }
 
@@ -38,21 +64,33 @@ sniff() {
   fi
 }
 
-# hash_of <string> -> SHA-256 前 16 位
+# hash_of <string> -> first 16 hex digits of its SHA-256
 hash_of() { printf %s "$1" | shasum -a 256 | cut -c1-16; }
 
-# describe <plain> -> "6 字符，全数字"。只描述形状，不含明文任何字节。
+# describe <plain> -> e.g. "6 chars, digits only". Shape only, never content.
 describe() {
   local p=$1 kind
   case $p in
-    *[!A-Za-z0-9]*) kind='含符号' ;;
-    *[A-Za-z]*)     kind='含字母' ;;
-    *)              kind='全数字' ;;
+    *[!A-Za-z0-9]*) kind='has symbols' ;;
+    *[A-Za-z]*)     kind='has letters' ;;
+    *)              kind='digits only' ;;
   esac
-  printf '%d 字符，%s' "${#p}" "$kind"
+  printf '%d chars, %s' "${#p}" "$kind"
 }
 
-# decode <mode> <blob> -> 明文到 stdout。3 = 私钥不可读，4 = 未知模式
+# is_printable_ascii <s> -> success iff every byte is in 0x20-0x7E.
+# Byte-level on purpose: grep is line-based and would let an embedded newline
+# through, and a bash pattern depends on the locale. An explicit octal range
+# under LC_ALL=C is exactly 0x20-0x7E on any tr, with no dependence on how a
+# character class is defined. Counting with wc -c (rather than testing the
+# output of a command substitution) keeps a lone newline from being stripped.
+is_printable_ascii() {
+  local n
+  n=$(printf %s "$1" | LC_ALL=C tr -d '\040-\176' | wc -c | tr -d ' ')
+  [ "$n" -eq 0 ]
+}
+
+# decode <mode> <blob> -> plaintext on stdout. 3 = key not readable, 4 = unknown mode
 decode() {
   local mode=$1 blob=$2
   case $mode in
@@ -64,107 +102,149 @@ decode() {
 }
 
 # clear_if_unchanged <hash> <ttl>
-# ttl 秒后，仅当剪贴板仍是我们写入的那份内容时清空它。
-# 守卫的意义：避免把用户在这期间复制的其它东西删掉。
+# After ttl seconds, clear the clipboard only if it still holds what we wrote.
+# The guard exists so we never wipe something the user copied in the meantime.
+# Fails closed: an empty or malformed hash (e.g. shasum failed) never matches,
+# otherwise "" = "" would wipe whatever is on the clipboard.
 clear_if_unchanged() {
-  local want=$1 ttl=$2
+  local want=$1 ttl=$2 have
+  case $want in ''|*[!0-9a-f]*) return 0 ;; esac
   [ "$ttl" -gt 0 ] && sleep "$ttl"
-  if [ "$(hash_of "$(pbpaste)")" = "$want" ]; then
+  have=$(hash_of "$(pbpaste)")
+  if [ "$have" = "$want" ]; then
     printf '' | pbcopy
   fi
   return 0
 }
 
+# schedule_clear <hash> <ttl>
+# Run clear_if_unchanged in a background subshell that ignores SIGHUP, so it
+# survives the terminal being closed (the same thing nohup does). A subshell,
+# not a re-exec of "$0", for two reasons:
+#  - The hash then lives only in this process's memory and never appears in
+#    argv. Any local user can read argv with `ps`, and endpoint/audit software
+#    often logs it. For a low-entropy secret such as a 6-digit code the hash is
+#    as good as the plaintext: all 10^6 candidates take well under a second.
+#  - It does not depend on how the script was invoked. With `bash blindpaste`,
+#    "$0" is a bare name that nohup would look up on PATH and not find.
+schedule_clear() {
+  local want=$1 ttl=$2
+  ( trap '' HUP; clear_if_unchanged "$want" "$ttl" ) </dev/null >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+}
+
 init_key() {
-  command -v age-keygen >/dev/null 2>&1 || die '未安装 age。先跑 brew install age' 3
-  [ -e "$BP_KEY" ] && die "密钥已存在：$BP_KEY（不覆盖）" 1
-  # 只在目录不存在时创建并收紧权限。默认密钥就在 repo 根目录里，
-  # 对一个已存在的目录 chmod 700 会改掉仓库本身的权限。
-  local dir; dir=$(dirname "$BP_KEY")
+  command -v age-keygen >/dev/null 2>&1 || die 'age is not installed (macOS: brew install age)' 3
+  [ -e "$BP_KEY" ] && die "key already exists: $BP_KEY (not overwriting)" 1
+  # Only create the directory, and tighten its permissions, if it does not
+  # exist yet. The default key lives in the repo root, and chmod 700 on an
+  # existing directory would change the permissions of the repo itself.
+  local dir; bp_parent "$BP_KEY"
   if [ ! -d "$dir" ]; then
-    mkdir -p "$dir" || die "无法创建 $dir"
+    mkdir -p "$dir" || die "cannot create $dir"
     chmod 700 "$dir"
   fi
-  ( umask 077; age-keygen -o "$BP_KEY" >/dev/null 2>&1 ) || die 'age-keygen 失败' 3
+  ( umask 077; age-keygen -o "$BP_KEY" >/dev/null 2>&1 ) || die 'age-keygen failed' 3
   chmod 600 "$BP_KEY"
-  printf '密钥已生成：%s\n公钥（用 blindpaste --sender 拿给对方的完整命令）：\n' "$BP_KEY" >&2
+  printf 'key created: %s\npublic key (run blindpaste --sender for the full command to forward):\n' "$BP_KEY" >&2
   grep -o 'age1[a-z0-9]*' "$BP_KEY" | head -1
 }
 
-# 始终打印 base64 版本，有密钥时追加 age 版本。
-# 我这边有没有密钥、和对方那边有没有装 age，是两件独立的事，脚本无法知道后者。
+# Always print the base64 command; add the age command when a key exists.
+# Whether I have a key and whether the sender has age installed are
+# independent, and the script cannot know the latter.
+#
+# In the sender commands:
+#  - `IFS= read -rs` reads without echo, keeps backslashes (-r) and keeps
+#    leading/trailing spaces (IFS=). The secret never enters shell history.
+#  - `echo >&2` ends the prompt line. read -s swallows the Enter key, so
+#    without it the ciphertext lands right after "secret: " on the same line,
+#    and copying from the start of the line breaks decoding.
 sender_cmds() {
   cat <<'EOF'
-# 转发给对方。两条都不会把明文写进对方的 shell history，也不依赖 pbcopy。
+# Forward one of these to the sender. Neither writes the secret to their
+# shell history, and neither needs pbcopy (they may be on Linux or WSL).
 
-# base64（对方无需装任何东西；只遮蔽，不加密）：
-printf 'secret: ' >&2; read -rs s; printf %s "$s" | base64 | tr -d '\n'; echo; unset s
+# base64 (nothing to install; obfuscation only, NOT encryption):
+printf 'secret: ' >&2; IFS= read -rs s; echo >&2; printf %s "$s" | base64 | tr -d '\n'; echo; unset s
 EOF
   if [ -r "$BP_KEY" ]; then
     local pub; pub=$(grep -o 'age1[a-z0-9]*' "$BP_KEY" | head -1)
-    printf '\n# age（对方需 brew install age；真加密，推荐）：\n'
-    printf "printf 'secret: ' >&2; read -rs s; printf %%s \"\$s\" | age -a -r %s; unset s\n" "$pub"
+    printf '\n# age (sender needs age installed; real encryption, recommended):\n'
+    printf "printf 'secret: ' >&2; IFS= read -rs s; echo >&2; printf %%s \"\$s\" | age -a -r %s; unset s\n" "$pub"
   else
-    printf '\n# age 版本不可用：还没生成密钥。先跑 blindpaste --init\n'
+    printf '\n# age command unavailable: no key yet. Run: blindpaste --init\n'
   fi
 }
 
 main() {
-  local ttl=$BP_DEFAULT_TTL src=clipboard blob mode plain rc
+  local ttl=$BP_DEFAULT_TTL src=clipboard blob mode plain rc h
 
   case ${1:-} in
     --init)    init_key; return $? ;;
     --sender)  sender_cmds; return 0 ;;
     -h|--help) usage; return 0 ;;
-    --__clear) [ $# -eq 3 ] || die '--__clear <hash> <ttl>'
-               clear_if_unchanged "$2" "$3"; return 0 ;;
   esac
 
   while [ $# -gt 0 ]; do
     case $1 in
-      -t) [ $# -ge 2 ] || die '-t 需要一个参数'
-          case $2 in ''|*[!0-9]*) die "-t 需要非负整数：$2" ;; esac
+      -t) [ $# -ge 2 ] || die '-t needs an argument'
+          case $2 in ''|*[!0-9]*) die "-t needs a non-negative integer: $2" ;; esac
           ttl=$2; shift 2 ;;
       -)  src=stdin; shift ;;
-      *)  die "未知参数：$1" ;;
+      *)  die "unknown argument: $1" ;;
     esac
   done
 
-  if [ "$src" = stdin ]; then blob=$(cat); else blob=$(pbpaste); fi
-  [ -n "$blob" ] || die '输入为空' 5
-
-  mode=$(sniff "$blob")
-  [ "$mode" != none ] || die '无法识别格式：既不是 age armor 也不是 base64。剪贴板未改动' 2
-
-  if [ "$mode" = age ] && ! command -v age >/dev/null 2>&1; then
-    die '这是 age 密文，但未安装 age。先跑 brew install age' 3
+  # pbcopy/pbpaste only exist on macOS. Fail clearly instead of half-working.
+  if ! command -v pbcopy >/dev/null 2>&1 || ! command -v pbpaste >/dev/null 2>&1; then
+    die 'pbcopy/pbpaste not found: blindpaste only runs on macOS' 3
   fi
 
-  plain=$(decode "$mode" "$blob"); rc=$?
+  if [ "$src" = stdin ]; then blob=$(cat); else blob=$(pbpaste); fi
+  [ -n "$blob" ] || die 'input is empty' 5
+
+  mode=$(sniff "$blob")
+  [ "$mode" != none ] || die 'unrecognized format: neither age armor nor base64. Clipboard unchanged' 2
+
+  if [ "$mode" = age ] && ! command -v age >/dev/null 2>&1; then
+    die 'this is age ciphertext, but age is not installed (macOS: brew install age)' 3
+  fi
+
+  # Command substitution silently drops NUL bytes, which would let a result
+  # containing NULs through altered. Map NUL to 0x01 first so the
+  # printable-ASCII check below rejects it. pipefail keeps decode's status.
+  plain=$(decode "$mode" "$blob" | LC_ALL=C tr '\000' '\001'); rc=$?
   case $rc in
     0) ;;
-    3) die "找不到可读的私钥：$BP_KEY。先跑 blindpaste --init" 3 ;;
-    *) die "解码失败（$mode）。剪贴板未改动" 4 ;;
+    3) die "no readable private key: $BP_KEY. Run: blindpaste --init" 3 ;;
+    *) die "decode failed ($mode). Clipboard unchanged" 4 ;;
   esac
-  [ -n "$plain" ] || die '解码结果为空。剪贴板未改动' 4
-  # sniff 无法区分真密文和一串恰好是 4 倍数长度的纯数字，后者解码出垃圾字节。
-  # 这个检查把那种情况变成干净的退出码 4，而不是往剪贴板里塞垃圾。
-  # 必须查「非可打印 ASCII」而不是「控制字符」：垃圾解码结果通常是 0x80-0xFF
-  # 的高位字节，那些不是控制字符。LC_ALL=C 让 [[:print:]] 严格等于 0x20-0x7E，
-  # 不受 locale 影响。
-  if printf %s "$plain" | LC_ALL=C grep -qE '[^[:print:]]'; then
-    die '解码结果含非可打印字符，多半不是给我的密文。剪贴板未改动' 4
+  [ -n "$plain" ] || die 'decoded result is empty. Clipboard unchanged' 4
+  # sniff cannot tell real base64 from, say, a string of digits whose length
+  # happens to be a multiple of 4; decoding the latter yields garbage bytes.
+  # This check turns that case into a clean exit 4 instead of putting garbage
+  # on the clipboard. Garbage is usually high bytes (0x80-0xFF), which are not
+  # control characters, so test for "not printable ASCII", not "control".
+  if ! is_printable_ascii "$plain"; then
+    die 'decoded result is not single-line printable ASCII (non-ASCII secrets are not supported); probably not ciphertext meant for you. Clipboard unchanged' 4
   fi
 
   printf %s "$plain" | pbcopy
-  printf '✓ %s  →  剪贴板已就绪（%s）\n' "$mode" "$(describe "$plain")" >&2
+  printf 'ok  %s -> clipboard ready (%s)\n' "$mode" "$(describe "$plain")" >&2
 
   if [ "$ttl" -gt 0 ]; then
-    # nohup 是必需的：否则关终端时 SIGHUP 杀掉它，剪贴板会永远留着明文。
-    # 传出去的是 hash 不是明文，且 hash 是纯十六进制，无注入风险。
-    nohup "$0" --__clear "$(hash_of "$plain")" "$ttl" >/dev/null 2>&1 &
-    disown 2>/dev/null || true
-    printf '  %d 秒后自动清空（仅在剪贴板未被改动时）\n' "$ttl" >&2
+    h=$(hash_of "$plain")
+    if [ ${#h} -ne 16 ]; then
+      printf '    warning: cannot hash the clipboard (is shasum installed?); auto-clear disabled\n' >&2
+      return 0
+    fi
+    # Do not carry the secret into the long-lived background process. Best
+    # effort: bash cannot scrub freed memory.
+    unset plain blob
+    schedule_clear "$h" "$ttl"
+    # %s, not %d: printf would read a leading zero (-t 08) as octal.
+    printf '    auto-clear in %ss (only if the clipboard is still unchanged)\n' "$ttl" >&2
   fi
 }
 
