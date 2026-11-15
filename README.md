@@ -1,105 +1,134 @@
 # blindpaste
 
-别人给我发一串数字（密码 / 一次性口令），我不想让它出现在我的屏幕上，但需要它进剪贴板以便直接 `Cmd-V`。
+**English** | [简体中文](README.zh-CN.md)
 
-`blindpaste` 把剪贴板里的密文原地替换为明文。明文只经由管道进 `pbcopy`，屏幕上只显示长度和字符类别：
+Someone sends you a secret (a password, a one-time code). You don't want it to appear on your screen, but you need it on the clipboard so you can just `Cmd-V` it.
+
+`blindpaste` replaces the ciphertext on your macOS clipboard with its plaintext, in place. The plaintext only travels through pipes into `pbcopy`; the screen shows nothing but its length and character class:
 
 ```
 $ ./blindpaste
-✓ b64  →  剪贴板已就绪（6 字符，全数字）
-  90 秒后自动清空（仅在剪贴板未被改动时）
+ok  b64 -> clipboard ready (6 chars, digits only)
+    auto-clear in 90s (only if the clipboard is still unchanged)
 ```
 
-这一行元信息是整个设计成立的前提 —— 我看不到内容，所以必须能确认解码成功、位数符合预期，否则盲粘贴一个坏结果时无从判断。
+That one line of metadata is what makes the design work. You can't see the content, so you need a way to confirm that decoding succeeded and that the length is what you expected — otherwise you'd blindly paste a broken result with no way to tell.
 
-## 关键点：剪贴板只是后半段
+> [!WARNING]
+> **Clipboard managers defeat this tool.** With Raycast, Alfred, Maccy, Paste or any other clipboard-history app running, the plaintext *will* be saved in its history, and you will see it the next time you browse it. If your clipboard manager can ignore specific apps, add your terminal; otherwise don't use blindpaste alongside it. See [Limitations](#limitations).
 
-只要对方把数字当普通文本发到微信或邮件里，它在我打开对话的那一刻就已经渲染到屏幕上了，任何剪贴板技巧都救不回来。**明文必须在到达我眼睛之前就被包住** —— 对方发送的必须是不可读的编码或密文。
+## Requirements
 
-所以用法的第一步是把命令发给对方：
+- **You (the receiver):** macOS. The system `/bin/bash` (3.2) is fine. Optional: [`age`](https://github.com/FiloSottile/age) for real encryption (`brew install age`).
+- **The sender:** any bash or zsh, on macOS, Linux or WSL. Nothing to install for base64; `age` for the encrypted variant.
+
+## The clipboard is only the second half
+
+If the sender pastes the digits into WeChat or an email as plain text, they're rendered on your screen the moment you open the conversation, and no clipboard trick can undo that. **The plaintext has to be wrapped before it reaches your eyes** — what the sender sends must be an unreadable encoding or ciphertext.
+
+So step one is sending the sender a command:
 
 ```sh
 ./blindpaste --sender
 ```
 
-它打印出对方该跑的命令。这些命令有两个性质：不把明文写进对方的 shell history（用 `read -rs`），也不依赖 `pbcopy`（对方可能在 Linux 或 WSL）。密文本身不是秘密 —— 对方本来就知道明文 —— 所以直接打在他终端里、由他复制转发就行。
+This prints the commands the sender should run. They have two properties: the secret is never written to the sender's shell history (it's read with `IFS= read -rs`), and they don't need `pbcopy` (the sender may be on Linux or WSL). There's no need to hide the ciphertext from the sender — they already know the plaintext — so it's printed straight to their terminal for them to copy and forward.
 
-对方把输出的那串乱码发给我，我选中复制，跑 `./blindpaste`，然后 `Cmd-V`。
+The sender sends you the resulting gibberish. You select and copy it, run `./blindpaste`, then `Cmd-V`.
 
-## 两种格式的安全性不同
+## Two formats, different security
 
-| 格式 | 对方需要 | 性质 |
+| Format | Sender needs | What it is |
 | --- | --- | --- |
-| base64 | 什么都不用装 | **只是遮蔽，不是加密。** 挡住我的眼睛，挡不住聊天服务商 —— 密文和明文对他们等价 |
-| age | `brew install age` | 真加密。聊天记录泄露也安全 |
+| base64 | nothing | **Obfuscation, not encryption.** Hides the secret from your eyes, not from the chat provider — to them, ciphertext and plaintext are equivalent |
+| age | `age` installed | Real encryption. Safe even if the chat history leaks |
 
-脚本自动嗅探收到的是哪种，无需告诉它。
+The script detects which one it received; you don't need to tell it.
 
-**如果这串数字是长期有效的真密码，而不是几分钟就失效的一次性口令，就该用 age。** base64 只适合「一次性口令 + 我只是不想看到它」这种场景。
+**If the secret is a long-lived password rather than a one-time code that expires in minutes, use age.** base64 is only appropriate for "one-time code, and I just don't want to see it".
 
-启用 age：
+To enable age:
 
 ```sh
 brew install age
-./blindpaste --init          # 生成密钥到仓库根目录的 .blindpaste.key，权限 600
-./blindpaste --sender        # 现在会同时打印 age 版本的命令
+./blindpaste --init          # creates .blindpaste.key in the repo root, mode 600
+./blindpaste --sender        # now also prints the age command
 ```
 
-`--sender` 始终打印 base64 版本、有密钥时追加 age 版本：我这边有没有密钥、和对方那边有没有装 `age`，是两件独立的事，脚本无法知道后者，所以由我在转发时决定发哪条。
+`--sender` always prints the base64 command and adds the age command when a key exists. Whether *you* have a key and whether *the sender* has `age` installed are independent, and the script can't know the latter, so you decide which one to forward.
 
-## 用法
+## Usage
 
 ```
-./blindpaste [-t 秒]     读剪贴板里的密文，解码后写回剪贴板
-./blindpaste - [-t 秒]   密文从 stdin 读
-./blindpaste --sender    打印转发给对方的命令
-./blindpaste --init      生成 age keypair
--t 0                     不自动清空剪贴板（默认 90 秒后清空）
+./blindpaste [-t SECONDS]     decode the ciphertext on the clipboard, put the plaintext back
+./blindpaste - [-t SECONDS]   read the ciphertext from stdin instead
+./blindpaste --sender         print the commands to forward to the sender
+./blindpaste --init           generate an age keypair
+-t 0                          do not auto-clear the clipboard (default: clear after 90 s)
 ```
 
-退出码：`0` 成功、`1` 用法错误、`2` 嗅探失败、`3` 缺依赖、`4` 解码失败、`5` 输入为空。**所有失败路径都保持剪贴板原样**，且不打印解码结果的任何字节。
+Exit codes: `0` success, `1` usage error (including `--init` when a key already exists), `2` unrecognized format, `3` missing dependency (no `age`, no readable key, or not on macOS), `4` decode failed, `5` empty input. **Every failure path leaves the clipboard untouched** and prints no byte of the decoded result.
 
-## 自动清空带 hash 守卫
+## Auto-clear with a hash guard
 
-默认 90 秒后清空剪贴板，但清空前会重新比对剪贴板内容的 hash：**如果我在这期间复制了别的东西，就什么都不做。** 否则这个功能会变成「90 秒后把你刚复制的东西删掉」的 bug。
+By default the clipboard is cleared after 90 seconds, but right before clearing, the clipboard's hash is compared again: **if you copied something else in the meantime, nothing happens.** Otherwise this feature would turn into "deletes whatever you copied 90 seconds later".
 
-## 自包含
+The clearer is a background subshell that ignores SIGHUP, so closing the terminal doesn't kill it. The hash it compares against lives only in that process's memory, never in its command line: `ps` shows every process's arguments to all local users, and endpoint/audit software often logs them, and for a 6-digit code a hash is as good as the plaintext (all 10^6 candidates take under a second).
 
-不需要安装。从仓库目录直接跑 `./blindpaste` 就行。
+## Self-contained
 
-这个工具不往 `$HOME`、`/usr/local`、shell 配置或任何系统位置写任何东西。age 私钥也生成在仓库根目录（`.blindpaste.key`），不在 `~/.config`。`tests/run.sh` 有四条断言锁住这个属性：默认密钥路径必须在仓库内、必须被 gitignore 覆盖、代码里不许出现 `$HOME` 或 `.local/bin`。
+Nothing to install. Run `./blindpaste` straight from the repo directory.
 
-代价是**仓库里躺着一个私钥**。`.gitignore` 明确列了 `.blindpaste.key`，测试也会用 `git check-ignore` 验证，但如果你要把这个仓库推到任何远端，先自己确认一遍。想把密钥放到别处就用环境变量覆盖：
+The tool never writes to `$HOME`, `/usr/local`, your shell config or any other system location. The age private key is also created in the repo root (`.blindpaste.key`), not in `~/.config`. `tests/run.sh` locks this in: the default key path must be inside the repo (also when the script is run through a symlink), it must be covered by `.gitignore`, and the code must not reference `$HOME` or `.local/bin`.
+
+The price is that **a private key sits inside the repo**. `.gitignore` lists `.blindpaste.key` explicitly and the tests verify that with `git check-ignore`, but:
+
+- Before pushing your copy of the repo anywhere, check it yourself.
+- `git clean -fdx` (or `-fdX`) deletes ignored files — **including your key**. If it's gone, run `--init` again and forward the new `--sender` command. Ciphertext made for the old key can no longer be decrypted, which doesn't matter for one-time codes.
+- If the repo is in a synced folder (iCloud Drive, Dropbox, …), the key is synced too.
+
+To keep the key somewhere else, override it with an environment variable:
 
 ```sh
 BLINDPASTE_KEY=~/somewhere/else.key ./blindpaste
 ```
 
-如果嫌每次打 `./` 麻烦，可以自己加个 alias（我没替你改任何 shell 配置）：
+If typing `./` every time gets old, add an alias or a symlink yourself (nothing touches your shell config for you):
 
 ```sh
 alias blindpaste="$PWD/blindpaste"
+# or
+ln -s "$PWD/blindpaste" ~/bin/blindpaste
 ```
 
-## 测试
+Symlinks are resolved, so the default key stays in the repo root either way.
+
+## Tests
 
 ```sh
 ./tests/run.sh
 ```
 
-不依赖 bats。测试会读写真实剪贴板，开始时保存、结束时恢复，**不可并行运行**。`age` 未安装时相关测试报 skip 而非静默通过。
+No bats needed; macOS only. The tests read and write the real clipboard: text content is saved at the start and restored at the end (non-text content such as an image is not restored), so **don't run them in parallel**. When `age` isn't installed, the tests that need it are reported as skipped rather than silently passing. A run takes a few seconds because it waits for a real auto-clear to fire.
 
-## 限制
+Design rationale: [docs/design.md](docs/design.md).
 
-以下三条决定「不被我看到」是否真的成立，值得逐条读：
+## Limitations
 
-1. **没有设 `org.nspasteboard.ConcealedType`。** 这是让剪贴板管理器跳过记录的社区约定，但 `pbcopy` 和 AppleScript 都设不了，需要 Swift 或 pyobjc。本机目前无剪贴板管理器，所以没做。**一旦装了 Raycast / Alfred / Maccy / Paste，明文就会进它们的历史记录，届时你翻历史一定会看到 —— 这个标记必须补上。**
-2. **通用剪贴板（Handoff）会把剪贴板同步到 iPhone / iPad。** 要挡住得在系统设置里关 Handoff，那是系统配置，不是本工具的职责。
-3. **明文在剪贴板里的这段时间，同机任何进程都能读它。** 这是 macOS 剪贴板的固有性质。本工具只能缩短暴露窗口，不能消除它。
+These three decide whether "it never shows up on my screen" actually holds. Read each one:
 
-其它：
+1. **`org.nspasteboard.ConcealedType` is not set.** That's the community convention telling clipboard managers to skip an entry, but neither `pbcopy` nor AppleScript can set it; it needs Swift or pyobjc. **With Raycast / Alfred / Maccy / Paste installed, the plaintext goes into their history, and browsing that history will show it to you.**
+2. **Universal Clipboard (Handoff) syncs the clipboard to your iPhone / iPad.** To prevent that, turn off Handoff in System Settings. That's system configuration, not this tool's job.
+3. **While the plaintext is on the clipboard, any app or process in your login session can read it.** That's inherent to the macOS clipboard. This tool shortens the exposure window; it can't eliminate it.
 
-- 明文尾部的空白字符会被剥掉（命令替换的固有行为）。对数字口令是正确行为。
-- 不支持含 NUL 字节的二进制密文 —— shell 变量承载不了。本工具面向文本密码。
-- 若在 TTL 到期前关机或杀掉后台进程，剪贴板不会被清空。
-- `base64` 与 `age` 都无法区分「合法密文」和「一串恰好长度合法的纯数字」。脚本用「解码结果必须是可打印 ASCII」作为安全网，把这种情况变成退出码 4 而不是往剪贴板塞垃圾字节。这个网不是百分之百的 —— 一串数字解码出的垃圾恰好全是可打印 ASCII 时会漏过，但元信息行里的字符类别会显示 `含符号`，足以让我察觉不对。
+Also:
+
+- Trailing whitespace in the plaintext is stripped (inherent to shell command substitution). That's the right behavior for numeric codes.
+- The plaintext must be a single line of printable ASCII (bytes 0x20–0x7E). Non-ASCII secrets (CJK characters, accented letters, emoji) and multi-line secrets are rejected with exit code 4. That's the safety net described in the last item.
+- Binary ciphertext containing NUL bytes isn't supported — shell variables can't hold NUL. This tool is for text passwords.
+- If the machine shuts down or the background process is killed before the TTL expires, the clipboard isn't cleared.
+- Format detection can't tell real base64 apart from a plain string of digits or letters whose length happens to be valid base64. The script's safety net is "the decoded result must be printable ASCII", which turns that case into exit code 4 instead of putting garbage bytes on the clipboard. The net isn't perfect: garbage that happens to be all printable ASCII slips through, but the character class in the metadata line then shows `has symbols`, which is enough to notice something is off.
+
+## License
+
+[MIT](LICENSE)
